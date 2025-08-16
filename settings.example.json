@@ -1,0 +1,64 @@
+{
+  "api": {
+    "host": "localhost",
+    "port": 8000,
+    "auth_token": "devlin-local-auth-token-change-me"
+  },
+  "database": {
+    "path": "./data/devlin.db",
+    "encryption_key": "change-this-encryption-key-32-chars"
+  },
+  "ai_providers": {
+    "default": "openai",
+    "openai": {
+      "api_key": "your-openai-api-key-here",
+      "model": "gpt-4",
+      "enabled": true
+    },
+    "claude": {
+      "api_key": "your-claude-api-key-here",
+      "model": "claude-3-sonnet-20240229",
+      "enabled": false
+    },
+    "deepseek": {
+      "api_key": "your-deepseek-api-key-here",
+      "model": "deepseek-chat",
+      "enabled": false
+    },
+    "ollama": {
+      "base_url": "http://localhost:11434",
+      "model": "llama2",
+      "enabled": false
+    }
+  },
+  "tools": {
+    "nmap": {
+      "path": "/usr/bin/nmap",
+      "default_options": "-T4 -sV -sC",
+      "max_concurrent_scans": 3
+    },
+    "metasploit": {
+      "rpc_host": "localhost",
+      "rpc_port": 55553,
+      "rpc_user": "msf",
+      "rpc_pass": "changeme"
+    },
+    "subfinder": {
+      "path": "/usr/bin/subfinder",
+      "config_path": "~/.config/subfinder/config.yaml"
+    },
+    "ffuf": {
+      "path": "/usr/bin/ffuf",
+      "wordlists_path": "/usr/share/wordlists"
+    }
+  },
+  "reporting": {
+    "template_path": "./templates",
+    "output_path": "./data/reports"
+  },
+  "security": {
+    "stealth_mode": false,
+    "scan_delay": 0,
+    "max_threads": 10
+  }
+}
