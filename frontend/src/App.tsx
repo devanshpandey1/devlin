@@ -17,7 +17,8 @@ import {
   Lock,
   AlertTriangle,
   CheckCircle,
-  XCircle
+  XCircle,
+  Brain
 } from 'lucide-react'
 
 interface ScanResult {
@@ -29,6 +30,7 @@ interface ScanResult {
   started_at: string
   results?: any
   error?: string
+  ai_analysis?: string
 }
 
 interface WebSocketMessage {
@@ -40,6 +42,9 @@ interface WebSocketMessage {
   error?: string
   message?: string
   timestamp: string
+  target?: string
+  scan_type?: string
+  ai_analysis?: string
 }
 
 function App() {
@@ -95,8 +100,8 @@ function App() {
         if (message.scan_id) {
           const newScan: ScanResult = {
             id: message.scan_id,
-            target: scanTarget,
-            type: scanType,
+            target: message.target || scanTarget,
+            type: message.scan_type || scanType,
             status: 'starting',
             progress: 0,
             started_at: message.timestamp
@@ -123,6 +128,25 @@ function App() {
               : scan
           ))
         }
+        break
+      
+      case 'ai_analysis_started':
+        addLog(`🤖 AI Analysis: ${message.message}`)
+        break
+      
+      case 'ai_analysis_completed':
+        if (message.scan_id) {
+          addLog(`✅ AI Analysis completed for scan ${message.scan_id}`)
+          setScans(prev => prev.map(scan => 
+            scan.id === message.scan_id 
+              ? { ...scan, ai_analysis: message.ai_analysis }
+              : scan
+          ))
+        }
+        break
+      
+      case 'ai_analysis_failed':
+        addLog(`❌ AI Analysis failed: ${message.error}`)
         break
       
       case 'scan_failed':
@@ -386,6 +410,18 @@ function App() {
                           {scan.error || 'Scan failed'}
                         </AlertDescription>
                       </Alert>
+                    )}
+                    
+                    {scan.ai_analysis && (
+                      <div className="mt-4 p-4 bg-purple-900/20 border border-purple-500/30 rounded-lg">
+                        <h4 className="text-purple-400 font-semibold mb-2 flex items-center">
+                          <Brain className="w-4 h-4 mr-2" />
+                          AI Analysis
+                        </h4>
+                        <div className="text-gray-300 text-sm whitespace-pre-wrap">
+                          {scan.ai_analysis}
+                        </div>
+                      </div>
                     )}
                   </CardContent>
                 </Card>
