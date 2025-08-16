@@ -33,9 +33,22 @@ interface ScanResult {
   ai_analysis?: string
 }
 
+interface ReconScan {
+  id: string
+  target: string
+  type: string
+  status: string
+  progress: number
+  started_at: string
+  results?: any
+  error?: string
+  ai_analysis?: string
+}
+
 interface WebSocketMessage {
   type: string
   scan_id?: string
+  recon_id?: string
   progress?: number
   status?: string
   results?: any
@@ -44,15 +57,21 @@ interface WebSocketMessage {
   timestamp: string
   target?: string
   scan_type?: string
+  recon_type?: string
   ai_analysis?: string
+  vulnerability_count?: number
+  risk_assessment?: any
 }
 
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard')
   const [scans, setScans] = useState<ScanResult[]>([])
+  const [reconScans, setReconScans] = useState<ReconScan[]>([])
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected')
   const [scanTarget, setScanTarget] = useState('')
   const [scanType, setScanType] = useState('quick')
+  const [reconTarget, setReconTarget] = useState('')
+  const [reconType, setReconType] = useState('subdomain')
   const [logs, setLogs] = useState<string[]>([])
   const [ws, setWs] = useState<WebSocket | null>(null)
 
@@ -149,6 +168,68 @@ function App() {
         addLog(`❌ AI Analysis failed: ${message.error}`)
         break
       
+      case 'recon_started':
+        if (message.recon_id) {
+          const newReconScan: ReconScan = {
+            id: message.recon_id,
+            target: message.target || '',
+            type: message.recon_type || '',
+            status: 'running',
+            progress: 0,
+            started_at: message.timestamp
+          }
+          setReconScans(prev => [newReconScan, ...prev])
+          addLog(`🔍 Recon started: ${message.recon_type} on ${message.target}`)
+        }
+        break
+      
+      case 'recon_progress':
+        if (message.recon_id) {
+          setReconScans(prev => prev.map(recon => 
+            recon.id === message.recon_id 
+              ? { ...recon, progress: message.progress || 0 }
+              : recon
+          ))
+        }
+        break
+      
+      case 'recon_completed':
+        if (message.recon_id) {
+          setReconScans(prev => prev.map(recon => 
+            recon.id === message.recon_id 
+              ? { ...recon, status: 'completed', progress: 100, results: message.results }
+              : recon
+          ))
+          addLog(`✅ Recon completed: ${message.recon_id}`)
+        }
+        break
+      
+      case 'recon_failed':
+        if (message.recon_id) {
+          setReconScans(prev => prev.map(recon => 
+            recon.id === message.recon_id 
+              ? { ...recon, status: 'failed', error: message.error }
+              : recon
+          ))
+          addLog(`❌ Recon failed: ${message.error}`)
+        }
+        break
+      
+      case 'recon_ai_analysis_completed':
+        if (message.recon_id) {
+          setReconScans(prev => prev.map(recon => 
+            recon.id === message.recon_id 
+              ? { ...recon, ai_analysis: message.ai_analysis }
+              : recon
+          ))
+          addLog(`🤖 Recon AI Analysis completed for ${message.recon_id}`)
+        }
+        break
+      
+      case 'vulnerabilities_found':
+        addLog(`🚨 Found ${message.vulnerability_count} vulnerabilities for ${message.target} (Risk: ${message.risk_assessment?.overall_risk})`)
+        break
+      
       case 'scan_failed':
         if (message.scan_id) {
           setScans(prev => prev.map(scan => 
@@ -189,6 +270,32 @@ function App() {
       }
     } catch (error) {
       addLog(`Error starting scan: ${error}`)
+    }
+  }
+
+  const startRecon = async () => {
+    if (!reconTarget.trim()) return
+    
+    try {
+      const params = new URLSearchParams()
+      params.append('target', reconTarget)
+      params.append('recon_type', reconType)
+      
+      const response = await fetch(`http://localhost:8000/recon/start?${params.toString()}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer devlin-local-auth-token-change-me'
+        }
+      })
+      
+      if (response.ok) {
+        addLog(`Started ${reconType} recon on ${reconTarget}`)
+        setReconTarget('')
+      } else {
+        addLog(`Failed to start recon: ${response.statusText}`)
+      }
+    } catch (error) {
+      addLog(`Error starting recon: ${error}`)
     }
   }
 
@@ -439,12 +546,149 @@ function App() {
           </TabsContent>
 
           <TabsContent value="recon">
-            <Card className="bg-gray-800 border-gray-700">
-              <CardContent className="text-center py-8">
-                <Search className="h-12 w-12 text-gray-600 mx-auto mb-4" />
-                <div className="text-gray-400">Reconnaissance modules coming soon...</div>
-              </CardContent>
-            </Card>
+            <div className="space-y-6">
+              <Card className="bg-gray-800 border-gray-700">
+                <CardHeader>
+                  <CardTitle className="text-green-400 flex items-center">
+                    <Search className="h-5 w-5 mr-2" />
+                    Reconnaissance
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-2">Target</label>
+                      <input
+                        type="text"
+                        value={reconTarget}
+                        onChange={(e) => setReconTarget(e.target.value)}
+                        placeholder="example.com or http://target.com"
+                        className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-green-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-2">Recon Type</label>
+                      <select
+                        value={reconType}
+                        onChange={(e) => setReconType(e.target.value)}
+                        className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white focus:outline-none focus:ring-2 focus:ring-green-500"
+                      >
+                        <option value="subdomain">Subdomain Enumeration</option>
+                        <option value="directory">Directory Fuzzing</option>
+                        <option value="tech_detection">Technology Detection</option>
+                      </select>
+                    </div>
+                    <div className="flex items-end">
+                      <button
+                        onClick={startRecon}
+                        disabled={!reconTarget.trim()}
+                        className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-md font-medium transition-colors"
+                      >
+                        Start Recon
+                      </button>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+
+              {reconScans.length > 0 && (
+                <Card className="bg-gray-800 border-gray-700">
+                  <CardHeader>
+                    <CardTitle className="text-green-400">Recon Results</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="space-y-4">
+                      {reconScans.map((recon) => (
+                        <div key={recon.id} className="border border-gray-600 rounded-lg p-4">
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="flex items-center space-x-2">
+                              {getStatusIcon(recon.status)}
+                              <span className="font-medium text-white">{recon.target}</span>
+                              <span className="text-sm text-gray-400">({recon.type})</span>
+                            </div>
+                            <span className={`text-sm font-medium ${getStatusColor(recon.status)}`}>
+                              {recon.status.toUpperCase()}
+                            </span>
+                          </div>
+                          
+                          {recon.status === 'running' && (
+                            <div className="mb-2">
+                              <div className="flex justify-between text-sm text-gray-400 mb-1">
+                                <span>Progress</span>
+                                <span>{recon.progress}%</span>
+                              </div>
+                              <div className="w-full bg-gray-700 rounded-full h-2">
+                                <div 
+                                  className="bg-green-500 h-2 rounded-full transition-all duration-300" 
+                                  style={{ width: `${recon.progress}%` }}
+                                ></div>
+                              </div>
+                            </div>
+                          )}
+                          
+                          {recon.results && (
+                            <div className="mt-3 p-3 bg-gray-900 rounded border">
+                              <h4 className="text-green-400 font-medium mb-2">Results:</h4>
+                              {recon.type === 'subdomain' && recon.results.subdomains && (
+                                <div>
+                                  <p className="text-gray-300 mb-2">Found {recon.results.subdomains.length} subdomains:</p>
+                                  <div className="text-sm text-gray-400 max-h-32 overflow-y-auto">
+                                    {recon.results.subdomains.slice(0, 10).map((sub: any, idx: number) => (
+                                      <div key={idx}>{sub.subdomain} → {sub.ip}</div>
+                                    ))}
+                                    {recon.results.subdomains.length > 10 && (
+                                      <div className="text-green-400">... and {recon.results.subdomains.length - 10} more</div>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                              {recon.type === 'directory' && recon.results.directories && (
+                                <div>
+                                  <p className="text-gray-300 mb-2">Found {recon.results.directories.length} directories:</p>
+                                  <div className="text-sm text-gray-400 max-h-32 overflow-y-auto">
+                                    {recon.results.directories.slice(0, 10).map((dir: any, idx: number) => (
+                                      <div key={idx}>{dir.path} ({dir.status_code})</div>
+                                    ))}
+                                    {recon.results.directories.length > 10 && (
+                                      <div className="text-green-400">... and {recon.results.directories.length - 10} more</div>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                              {recon.type === 'tech_detection' && recon.results.technologies && (
+                                <div>
+                                  <p className="text-gray-300 mb-2">Detected {recon.results.technologies.length} technologies:</p>
+                                  <div className="text-sm text-gray-400">
+                                    {recon.results.technologies.map((tech: any, idx: number) => (
+                                      <div key={idx}>{tech.name} ({tech.confidence})</div>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          
+                          {recon.ai_analysis && (
+                            <div className="mt-3 p-3 bg-blue-900/20 rounded border border-blue-700">
+                              <h4 className="text-blue-400 font-medium mb-2">🤖 AI Analysis:</h4>
+                              <pre className="text-sm text-gray-300 whitespace-pre-wrap max-h-32 overflow-y-auto">
+                                {recon.ai_analysis}
+                              </pre>
+                            </div>
+                          )}
+                          
+                          {recon.error && (
+                            <div className="mt-2 p-2 bg-red-900/20 rounded border border-red-700">
+                              <span className="text-red-400 text-sm">{recon.error}</span>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+            </div>
           </TabsContent>
 
           <TabsContent value="exploits">

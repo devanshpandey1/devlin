@@ -12,7 +12,9 @@ from datetime import datetime
 import uuid
 import re
 from openai import OpenAI
-from .database import DatabaseManager, Project, Target, ScanResult, Finding
+from .database import DatabaseManager, Project, Target, ScanResult, Finding, ReconResult, Vulnerability
+from .recon import recon_engine
+from .cve_manager import cve_manager
 
 connected_websockets: List[WebSocket] = []
 active_scans: Dict[str, Dict] = {}
@@ -367,6 +369,8 @@ async def execute_nmap_scan(scan_id: str, target: str, scan_type: str):
         
         update_scan_in_database(scan_id, ai_analysis=ai_results.get("ai_analysis", ""))
         
+        await analyze_vulnerabilities_for_scan(scan_id, results)
+        
     except Exception as e:
         active_scans[scan_id]["status"] = "failed"
         active_scans[scan_id]["error"] = str(e)
@@ -601,6 +605,358 @@ async def list_targets(project_id: int = None, token: str = Depends(verify_token
                 for t in targets
             ]
         }
+    finally:
+        session.close()
+
+@app.post("/recon/start")
+async def start_recon(
+    target: str,
+    recon_type: str = "subdomain",
+    token: str = Depends(verify_token)
+):
+    """Start reconnaissance scan"""
+    recon_id = str(uuid.uuid4())
+    
+    recon_config = {
+        "id": recon_id,
+        "target": target,
+        "type": recon_type,
+        "status": "starting",
+        "started_at": datetime.utcnow().isoformat(),
+        "progress": 0
+    }
+    
+    active_scans[f"recon_{recon_id}"] = recon_config
+    
+    await broadcast_message({
+        "type": "recon_started",
+        "recon_id": recon_id,
+        "target": target,
+        "recon_type": recon_type,
+        "timestamp": datetime.utcnow().isoformat()
+    })
+    
+    asyncio.create_task(execute_recon(recon_id, target, recon_type))
+    
+    return {"recon_id": recon_id, "status": "started"}
+
+@app.get("/recon/{recon_id}")
+async def get_recon_results(recon_id: str, token: str = Depends(verify_token)):
+    """Get reconnaissance results by ID"""
+    scan_key = f"recon_{recon_id}"
+    if scan_key not in active_scans:
+        raise HTTPException(status_code=404, detail="Recon scan not found")
+    
+    return active_scans[scan_key]
+
+@app.get("/vulnerabilities/{target_id}")
+async def get_vulnerabilities(target_id: int, token: str = Depends(verify_token)):
+    """Get vulnerabilities for a target"""
+    if not db_manager:
+        return {"vulnerabilities": []}
+        
+    session = db_manager.get_session()
+    try:
+        vulnerabilities = session.query(Vulnerability).filter(Vulnerability.target_id == target_id).all()
+        return {
+            "vulnerabilities": [
+                {
+                    "id": v.id,
+                    "cve_id": v.cve_id,
+                    "service": v.service,
+                    "version": v.version,
+                    "severity": v.severity,
+                    "cvss_score": v.cvss_score,
+                    "description": v.description,
+                    "exploit_available": v.exploit_available,
+                    "ai_risk_assessment": v.ai_risk_assessment,
+                    "created_at": v.created_at.isoformat()
+                }
+                for v in vulnerabilities
+            ]
+        }
+    finally:
+        session.close()
+
+async def execute_recon(recon_id: str, target: str, recon_type: str):
+    """Execute reconnaissance scan"""
+    scan_key = f"recon_{recon_id}"
+    
+    try:
+        active_scans[scan_key]["status"] = "running"
+        
+        save_recon_to_database(recon_id, target, recon_type, "running", 0, active_scans[scan_key]["started_at"])
+        
+        async def progress_callback(progress):
+            active_scans[scan_key]["progress"] = progress
+            await broadcast_message({
+                "type": "recon_progress",
+                "recon_id": recon_id,
+                "progress": progress,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            update_recon_in_database(recon_id, progress=progress)
+        
+        if recon_type == "subdomain":
+            results = await recon_engine.subdomain_enumeration(target, progress_callback)
+        elif recon_type == "directory":
+            results = await recon_engine.directory_fuzzing(target, progress_callback)
+        elif recon_type == "tech_detection":
+            results = await recon_engine.technology_detection(target, progress_callback)
+        else:
+            raise ValueError(f"Unknown recon type: {recon_type}")
+        
+        active_scans[scan_key]["status"] = "completed"
+        active_scans[scan_key]["progress"] = 100
+        active_scans[scan_key]["results"] = results
+        active_scans[scan_key]["completed_at"] = datetime.utcnow().isoformat()
+        
+        update_recon_in_database(
+            recon_id,
+            status="completed",
+            progress=100,
+            completed_at=active_scans[scan_key]["completed_at"],
+            results_data=results
+        )
+        
+        await broadcast_message({
+            "type": "recon_completed",
+            "recon_id": recon_id,
+            "results": results,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        ai_analysis = await analyze_recon_with_ai(recon_id, results, recon_type)
+        active_scans[scan_key]["ai_analysis"] = ai_analysis.get("ai_analysis", "")
+        update_recon_in_database(recon_id, ai_analysis=ai_analysis.get("ai_analysis", ""))
+        
+    except Exception as e:
+        active_scans[scan_key]["status"] = "failed"
+        active_scans[scan_key]["error"] = str(e)
+        
+        update_recon_in_database(recon_id, status="failed", error_message=str(e))
+        
+        await broadcast_message({
+            "type": "recon_failed",
+            "recon_id": recon_id,
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        })
+
+async def analyze_recon_with_ai(recon_id: str, recon_results: Dict[str, Any], recon_type: str) -> Dict[str, Any]:
+    """Analyze recon results using AI"""
+    try:
+        if not config.get("ai_providers", {}).get("default"):
+            return {"ai_analysis": "AI analysis disabled - no provider configured"}
+        
+        provider_config = config.get("ai_providers", {})
+        default_provider = provider_config.get("default", "openai")
+        
+        if default_provider == "openai":
+            openai_config = provider_config.get("openai", {})
+            if not openai_config.get("enabled", False) or not openai_config.get("api_key") or openai_config.get("api_key") == "your-openai-api-key-here":
+                return {"ai_analysis": "OpenAI not configured or disabled"}
+            
+            client = OpenAI(api_key=openai_config.get("api_key"))
+            
+            if recon_type == "subdomain":
+                found_subdomains = recon_results.get("subdomains", [])
+                subdomain_list = [sub["subdomain"] for sub in found_subdomains]
+                
+                prompt = f"""
+                Analyze this subdomain enumeration result for security assessment:
+                
+                Target Domain: {recon_results.get('domain')}
+                Found Subdomains: {len(subdomain_list)}
+                Subdomains: {', '.join(subdomain_list[:20])}
+                
+                Please provide:
+                1. Analysis of discovered subdomains and their potential purposes
+                2. Security implications of exposed subdomains
+                3. Recommended next steps for further reconnaissance
+                4. Risk assessment based on subdomain exposure
+                
+                Format as JSON with keys: subdomain_analysis, security_implications, next_steps, risk_level
+                """
+            
+            elif recon_type == "directory":
+                found_dirs = recon_results.get("directories", [])
+                dir_list = [d["path"] for d in found_dirs]
+                
+                prompt = f"""
+                Analyze this directory fuzzing result for security assessment:
+                
+                Target: {recon_results.get('target')}
+                Found Directories: {len(dir_list)}
+                Directories: {', '.join(dir_list[:20])}
+                
+                Please provide:
+                1. Analysis of discovered directories and their purposes
+                2. Security implications of exposed directories
+                3. Potential sensitive information exposure
+                4. Risk assessment based on directory exposure
+                
+                Format as JSON with keys: directory_analysis, security_implications, sensitive_exposure, risk_level
+                """
+            
+            elif recon_type == "tech_detection":
+                technologies = recon_results.get("technologies", [])
+                tech_list = [t["name"] for t in technologies]
+                
+                prompt = f"""
+                Analyze this technology detection result for security assessment:
+                
+                Target: {recon_results.get('target')}
+                Detected Technologies: {', '.join(tech_list)}
+                Server Info: {recon_results.get('server_info', {})}
+                
+                Please provide:
+                1. Analysis of detected technologies and versions
+                2. Known vulnerabilities for detected technologies
+                3. Security recommendations for the technology stack
+                4. Risk assessment based on technology exposure
+                
+                Format as JSON with keys: technology_analysis, known_vulnerabilities, security_recommendations, risk_level
+                """
+            
+            response = client.chat.completions.create(
+                model=openai_config.get("model", "gpt-4"),
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1000,
+                temperature=0.3
+            )
+            
+            ai_content = response.choices[0].message.content
+            
+            await broadcast_message({
+                "type": "recon_ai_analysis_completed",
+                "recon_id": recon_id,
+                "ai_analysis": ai_content,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            
+            return {"ai_analysis": ai_content}
+            
+    except Exception as e:
+        error_msg = f"Recon AI analysis failed: {str(e)}"
+        await broadcast_message({
+            "type": "recon_ai_analysis_failed",
+            "recon_id": recon_id,
+            "error": error_msg,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        return {"ai_analysis": error_msg}
+
+async def analyze_vulnerabilities_for_scan(scan_id: str, scan_results: Dict[str, Any]):
+    """Analyze scan results for vulnerabilities using CVE database"""
+    try:
+        target_ip = scan_results.get("target")
+        ports = scan_results.get("ports", [])
+        
+        if not db_manager or not target_ip:
+            return
+        
+        session = db_manager.get_session()
+        try:
+            target = session.query(Target).filter(Target.ip_address == target_ip).first()
+            if not target:
+                return
+            
+            session.query(Vulnerability).filter(Vulnerability.target_id == target.id).delete()
+            
+            all_vulnerabilities = []
+            
+            for port_data in ports:
+                service = port_data.get("service", "")
+                version = port_data.get("version", "")
+                
+                if service and port_data.get("state") == "open":
+                    vulnerabilities = cve_manager.match_vulnerabilities(service, version)
+                    
+                    for vuln in vulnerabilities:
+                        vulnerability = Vulnerability(
+                            target_id=target.id,
+                            cve_id=vuln.get("cve_id"),
+                            service=service,
+                            version=version,
+                            severity=vuln.get("severity", "low"),
+                            cvss_score=vuln.get("cvss_score", 0.0),
+                            description=vuln.get("description", ""),
+                            exploit_available=vuln.get("exploit_available", False)
+                        )
+                        session.add(vulnerability)
+                        all_vulnerabilities.append(vuln)
+            
+            session.commit()
+            
+            if all_vulnerabilities:
+                risk_assessment = cve_manager.get_risk_assessment(all_vulnerabilities)
+                
+                await broadcast_message({
+                    "type": "vulnerabilities_found",
+                    "scan_id": scan_id,
+                    "target": target_ip,
+                    "vulnerability_count": len(all_vulnerabilities),
+                    "risk_assessment": risk_assessment,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+        
+        finally:
+            session.close()
+            
+    except Exception as e:
+        print(f"Vulnerability analysis error: {e}")
+
+def save_recon_to_database(recon_id: str, target: str, recon_type: str, status: str, progress: int, started_at: str):
+    """Save recon to database"""
+    if not db_manager:
+        return
+        
+    session = db_manager.get_session()
+    try:
+        project = session.query(Project).filter(Project.name == "Default").first()
+        if not project:
+            project = Project(name="Default", description="Default project for scans")
+            session.add(project)
+            session.commit()
+            session.refresh(project)
+        
+        target_obj = get_or_create_target(session, target, project_id=project.id)
+        
+        recon_result = ReconResult(
+            id=recon_id,
+            target_id=target_obj.id,
+            recon_type=recon_type,
+            status=status,
+            progress=progress,
+            started_at=datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+        )
+        
+        session.add(recon_result)
+        session.commit()
+        
+    except Exception as e:
+        print(f"Database recon save error: {e}")
+    finally:
+        session.close()
+
+def update_recon_in_database(recon_id: str, **updates):
+    """Update recon in database"""
+    if not db_manager:
+        return
+        
+    session = db_manager.get_session()
+    try:
+        recon = session.query(ReconResult).filter(ReconResult.id == recon_id).first()
+        if recon:
+            for key, value in updates.items():
+                if hasattr(recon, key):
+                    if key == 'completed_at' and isinstance(value, str):
+                        value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                    setattr(recon, key, value)
+            session.commit()
+    except Exception as e:
+        print(f"Database recon update error: {e}")
     finally:
         session.close()
 

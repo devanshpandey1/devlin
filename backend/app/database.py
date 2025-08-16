@@ -29,6 +29,8 @@ class Target(Base):
     
     project = relationship("Project", back_populates="targets")
     scan_results = relationship("ScanResult", back_populates="target", cascade="all, delete-orphan")
+    recon_results = relationship("ReconResult", back_populates="target", cascade="all, delete-orphan")
+    vulnerabilities = relationship("Vulnerability", back_populates="target", cascade="all, delete-orphan")
 
 class ScanResult(Base):
     __tablename__ = "scan_results"
@@ -60,6 +62,39 @@ class Finding(Base):
     risk_level = Column(String(10))
     
     scan_result = relationship("ScanResult", back_populates="findings")
+
+class ReconResult(Base):
+    __tablename__ = "recon_results"
+    
+    id = Column(String(36), primary_key=True)
+    target_id = Column(Integer, ForeignKey("targets.id"), nullable=False)
+    recon_type = Column(String(50), nullable=False)
+    status = Column(String(20), nullable=False)
+    progress = Column(Integer, default=0)
+    started_at = Column(DateTime, nullable=False)
+    completed_at = Column(DateTime)
+    results_data = Column(JSON)
+    ai_analysis = Column(Text)
+    error_message = Column(Text)
+    
+    target = relationship("Target", back_populates="recon_results")
+
+class Vulnerability(Base):
+    __tablename__ = "vulnerabilities"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    target_id = Column(Integer, ForeignKey("targets.id"), nullable=False)
+    cve_id = Column(String(20))
+    service = Column(String(100))
+    version = Column(String(255))
+    severity = Column(String(10))
+    cvss_score = Column(Float)
+    description = Column(Text)
+    exploit_available = Column(Boolean, default=False)
+    ai_risk_assessment = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    target = relationship("Target", back_populates="vulnerabilities")
 
 class DatabaseManager:
     def __init__(self, config: dict):
