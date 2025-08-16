@@ -12,6 +12,9 @@ psycopg = {extras = ["binary"], version = "^3.2.9"}
 websockets = "^15.0.1"
 python-multipart = "^0.0.20"
 openai = "^1.99.9"
+sqlalchemy = "^2.0.43"
+alembic = "^1.16.4"
+pysqlcipher3 = "^1.2.0"
 
 
 [build-system]

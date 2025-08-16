@@ -12,10 +12,12 @@ from datetime import datetime
 import uuid
 import re
 from openai import OpenAI
+from .database import DatabaseManager, Project, Target, ScanResult, Finding
 
 connected_websockets: List[WebSocket] = []
 active_scans: Dict[str, Dict] = {}
 config: Dict = {}
+db_manager = None
 
 def load_config():
     """Load configuration from settings.json"""
@@ -31,10 +33,15 @@ def load_config():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize application on startup"""
+    global db_manager
     load_config()
     os.makedirs("../data/scans", exist_ok=True)
     os.makedirs("../data/reports", exist_ok=True)
     os.makedirs("../data/loot", exist_ok=True)
+    
+    db_manager = DatabaseManager(config)
+    db_manager.initialize()
+    
     yield
 
 app = FastAPI(title="Devlin Pentesting API", version="1.0.0", lifespan=lifespan)
@@ -128,6 +135,8 @@ async def start_nmap_scan(
     }
     
     active_scans[scan_id] = scan_config
+    
+    save_scan_to_database(scan_id, target, scan_type, "starting", 0, scan_config["started_at"])
     
     await broadcast_message({
         "type": "scan_started",
@@ -271,6 +280,9 @@ async def execute_nmap_scan(scan_id: str, target: str, scan_type: str):
             except asyncio.TimeoutError:
                 if process.returncode is None:
                     active_scans[scan_id]["progress"] = min(90, active_scans[scan_id]["progress"] + 10)
+                    
+                    update_scan_in_database(scan_id, progress=active_scans[scan_id]["progress"])
+                    
                     await broadcast_message({
                         "type": "scan_progress",
                         "scan_id": scan_id,
@@ -326,6 +338,16 @@ async def execute_nmap_scan(scan_id: str, target: str, scan_type: str):
         active_scans[scan_id]["status"] = "completed"
         active_scans[scan_id]["progress"] = 100
         
+        update_scan_in_database(
+            scan_id,
+            status="completed",
+            progress=100,
+            completed_at=results["completed_at"],
+            raw_xml_path=scan_file
+        )
+        
+        save_findings_to_database(scan_id, results.get("ports", []))
+        
         await broadcast_message({
             "type": "scan_completed",
             "scan_id": scan_id,
@@ -342,6 +364,8 @@ async def execute_nmap_scan(scan_id: str, target: str, scan_type: str):
         
         ai_results = await analyze_scan_with_ai(scan_id, results)
         active_scans[scan_id]["ai_analysis"] = ai_results.get("ai_analysis", "")
+        
+        update_scan_in_database(scan_id, ai_analysis=ai_results.get("ai_analysis", ""))
         
     except Exception as e:
         active_scans[scan_id]["status"] = "failed"
@@ -428,3 +452,181 @@ async def get_scan_results(scan_id: str, token: str = Depends(verify_token)):
         raise HTTPException(status_code=404, detail="Scan not found")
     
     return active_scans[scan_id]
+
+def get_or_create_target(session, ip_address: str, hostname: str = None, project_id: int = 1):
+    """Get existing target or create new one"""
+    target = session.query(Target).filter(
+        Target.ip_address == ip_address,
+        Target.project_id == project_id
+    ).first()
+    
+    if not target:
+        target = Target(
+            project_id=project_id,
+            ip_address=ip_address,
+            hostname=hostname
+        )
+        session.add(target)
+        session.commit()
+        session.refresh(target)
+    
+    return target
+
+def save_scan_to_database(scan_id: str, target: str, scan_type: str, status: str, progress: int, started_at: str):
+    """Save scan to database"""
+    if not db_manager:
+        return
+        
+    session = db_manager.get_session()
+    try:
+        project = session.query(Project).filter(Project.name == "Default").first()
+        if not project:
+            project = Project(name="Default", description="Default project for scans")
+            session.add(project)
+            session.commit()
+            session.refresh(project)
+        
+        target_obj = get_or_create_target(session, target, project_id=project.id)
+        
+        scan_result = ScanResult(
+            id=scan_id,
+            target_id=target_obj.id,
+            scan_type=scan_type,
+            status=status,
+            progress=progress,
+            started_at=datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+        )
+        
+        session.add(scan_result)
+        session.commit()
+        
+    except Exception as e:
+        print(f"Database save error: {e}")
+    finally:
+        session.close()
+
+def update_scan_in_database(scan_id: str, **updates):
+    """Update scan in database"""
+    if not db_manager:
+        return
+        
+    session = db_manager.get_session()
+    try:
+        scan = session.query(ScanResult).filter(ScanResult.id == scan_id).first()
+        if scan:
+            for key, value in updates.items():
+                if hasattr(scan, key):
+                    if key == 'completed_at' and isinstance(value, str):
+                        value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                    setattr(scan, key, value)
+            session.commit()
+    except Exception as e:
+        print(f"Database update error: {e}")
+    finally:
+        session.close()
+
+def save_findings_to_database(scan_id: str, ports: list):
+    """Save port findings to database"""
+    if not db_manager:
+        return
+        
+    session = db_manager.get_session()
+    try:
+        session.query(Finding).filter(Finding.scan_result_id == scan_id).delete()
+        
+        for port_data in ports:
+            finding = Finding(
+                scan_result_id=scan_id,
+                port=port_data.get('port', 0),
+                protocol=port_data.get('protocol', 'tcp'),
+                service=port_data.get('service', ''),
+                version=port_data.get('version', ''),
+                state=port_data.get('state', ''),
+                risk_level='medium' if port_data.get('state') == 'open' else 'low'
+            )
+            session.add(finding)
+        
+        session.commit()
+    except Exception as e:
+        print(f"Database findings save error: {e}")
+    finally:
+        session.close()
+
+@app.get("/projects")
+async def list_projects(token: str = Depends(verify_token)):
+    """List all projects"""
+    if not db_manager:
+        return {"projects": []}
+        
+    session = db_manager.get_session()
+    try:
+        projects = session.query(Project).all()
+        return {
+            "projects": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "description": p.description,
+                    "created_at": p.created_at.isoformat(),
+                    "target_count": len(p.targets)
+                }
+                for p in projects
+            ]
+        }
+    finally:
+        session.close()
+
+@app.get("/targets")
+async def list_targets(project_id: int = None, token: str = Depends(verify_token)):
+    """List all targets, optionally filtered by project"""
+    if not db_manager:
+        return {"targets": []}
+        
+    session = db_manager.get_session()
+    try:
+        query = session.query(Target)
+        if project_id:
+            query = query.filter(Target.project_id == project_id)
+        
+        targets = query.all()
+        return {
+            "targets": [
+                {
+                    "id": t.id,
+                    "ip_address": t.ip_address,
+                    "hostname": t.hostname,
+                    "project_id": t.project_id,
+                    "scan_count": len(t.scan_results)
+                }
+                for t in targets
+            ]
+        }
+    finally:
+        session.close()
+
+@app.get("/scans/database")
+async def list_database_scans(token: str = Depends(verify_token)):
+    """List all scans from database"""
+    if not db_manager:
+        return {"scans": []}
+        
+    session = db_manager.get_session()
+    try:
+        scans = session.query(ScanResult).order_by(ScanResult.started_at.desc()).all()
+        return {
+            "scans": [
+                {
+                    "id": s.id,
+                    "target_ip": s.target.ip_address,
+                    "scan_type": s.scan_type,
+                    "status": s.status,
+                    "progress": s.progress,
+                    "started_at": s.started_at.isoformat(),
+                    "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                    "finding_count": len(s.findings)
+                }
+                for s in scans
+            ]
+        }
+    finally:
+        session.close()
